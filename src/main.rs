@@ -1,5 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+const ICON_PNG: &[u8] = include_bytes!("../icon.png");
+const ICON_ICO: &[u8] = include_bytes!("../icon.ico");
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -15,6 +18,8 @@ use serde_json::Value;
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::Shell::IsUserAnAdmin;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -77,7 +82,6 @@ struct IpFlipRustApp {
 
 impl IpFlipRustApp {
     fn new(cc: &CreationContext<'_>) -> Self {
-        let app_base = app_base_path();
         let profiles_path = app_data_dir().join("ip_profiles.json");
         let profiles = load_profiles(&profiles_path);
 
@@ -86,7 +90,7 @@ impl IpFlipRustApp {
             .map(|p| p.net_interface.clone())
             .unwrap_or_default();
 
-        let logo_texture = load_logo_texture(cc, &app_base);
+        let logo_texture = load_logo_texture(cc);
         let (tx, rx) = mpsc::channel();
 
         let mut app = Self {
@@ -559,8 +563,16 @@ impl App for IpFlipRustApp {
 fn main() {
     ensure_windows_elevation();
 
+    let scale = system_scale_factor();
+    let (w, h) = (1000.0 / scale, 800.0 / scale);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([w, h])
+        .with_min_inner_size([w, h]);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let native_options = NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1160.0, 720.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -571,13 +583,21 @@ fn main() {
     );
 }
 
-fn app_base_path() -> PathBuf {
-    if let Ok(exe) = env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.to_path_buf();
-        }
-    }
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+#[cfg(target_os = "windows")]
+fn system_scale_factor() -> f32 {
+    let dpi = unsafe { GetDpiForSystem() };
+    dpi as f32 / 96.0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_scale_factor() -> f32 {
+    1.0
+}
+
+fn load_window_icon() -> Option<egui::viewport::IconData> {
+    let image = image::load_from_memory(ICON_ICO).ok()?.to_rgba8();
+    let (width, height) = image.dimensions();
+    Some(egui::viewport::IconData { rgba: image.into_raw(), width, height })
 }
 
 fn app_data_dir() -> PathBuf {
@@ -968,26 +988,11 @@ fn is_ipv4(value: &str) -> bool {
     true
 }
 
-fn load_logo_texture(cc: &CreationContext<'_>, app_base: &Path) -> Option<TextureHandle> {
-    let icon_path = app_base.join("icon.png");
-    let logo_path = app_base.join("logo.svg");
-    let chosen = if icon_path.exists() { icon_path } else { logo_path };
-
-    if !chosen.exists() {
-        return None;
-    }
-
-    let bytes = fs::read(chosen).ok()?;
-    let image = image::load_from_memory(&bytes).ok()?;
-    let rgba = image.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
-
-    Some(cc.egui_ctx.load_texture(
-        "ipflip-logo",
-        color_image,
-        egui::TextureOptions::LINEAR,
-    ))
+fn load_logo_texture(cc: &CreationContext<'_>) -> Option<TextureHandle> {
+    let image = image::load_from_memory(ICON_PNG).ok()?.to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &image);
+    Some(cc.egui_ctx.load_texture("ipflip-logo", color_image, egui::TextureOptions::LINEAR))
 }
 
 #[cfg(target_os = "windows")]
