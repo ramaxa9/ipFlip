@@ -1,6 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-const ICON_PNG: &[u8] = include_bytes!("../icon.png");
 const ICON_ICO: &[u8] = include_bytes!("../icon.ico");
 
 use std::collections::HashMap;
@@ -11,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use eframe::egui::{self, Color32, Frame, RichText, TextureHandle};
+use eframe::egui::{self, Color32, CornerRadius, Frame, RichText, Stroke, Vec2};
 use eframe::{App, CreationContext, NativeOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,6 +25,33 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+// ---------- Palette ----------
+// A calm, modern dark theme: deep slate background, layered surfaces,
+// an indigo primary accent, and clearly differentiated action colors.
+mod palette {
+    use eframe::egui::Color32;
+
+    pub const BG: Color32 = Color32::from_rgb(13, 15, 20);
+    pub const SURFACE: Color32 = Color32::from_rgb(19, 22, 30);
+    pub const SURFACE_ALT: Color32 = Color32::from_rgb(24, 28, 38);
+    pub const ELEVATED: Color32 = Color32::from_rgb(30, 35, 47);
+    pub const BORDER: Color32 = Color32::from_rgb(38, 43, 56);
+
+    pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(232, 234, 240);
+    pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(148, 155, 175);
+    pub const TEXT_MUTED: Color32 = Color32::from_rgb(96, 102, 122);
+
+    pub const ACCENT: Color32 = Color32::from_rgb(129, 140, 248); // indigo-400
+    pub const ACCENT_STRONG: Color32 = Color32::from_rgb(99, 102, 241); // indigo-500
+
+    pub const SUCCESS: Color32 = Color32::from_rgb(52, 211, 153); // emerald-400
+    pub const SUCCESS_BG: Color32 = Color32::from_rgb(20, 40, 36);
+    pub const INFO: Color32 = Color32::from_rgb(56, 189, 248); // sky-400
+    pub const WARNING: Color32 = Color32::from_rgb(251, 191, 36); // amber-400
+    pub const DANGER: Color32 = Color32::from_rgb(248, 113, 113); // red-400
+    pub const DANGER_BG: Color32 = Color32::from_rgb(43, 22, 24);
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct IpProfile {
@@ -62,6 +88,13 @@ enum WorkerMessage {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatusTone {
+    Neutral,
+    Success,
+    Danger,
+}
+
 struct IpFlipRustApp {
     profiles: Vec<IpProfile>,
     interfaces: Vec<String>,
@@ -72,16 +105,16 @@ struct IpFlipRustApp {
     gateway_text: String,
     current_settings_message: String,
     status_message: String,
+    status_tone: StatusTone,
     request_id: u64,
     interfaces_loading: bool,
     tx: Sender<WorkerMessage>,
     rx: Receiver<WorkerMessage>,
     profiles_path: PathBuf,
-    logo_texture: Option<TextureHandle>,
 }
 
 impl IpFlipRustApp {
-    fn new(cc: &CreationContext<'_>) -> Self {
+    fn new(_cc: &CreationContext<'_>) -> Self {
         let profiles_path = app_data_dir().join("ip_profiles.json");
         let profiles = load_profiles(&profiles_path);
 
@@ -90,7 +123,6 @@ impl IpFlipRustApp {
             .map(|p| p.net_interface.clone())
             .unwrap_or_default();
 
-        let logo_texture = load_logo_texture(cc);
         let (tx, rx) = mpsc::channel();
 
         let mut app = Self {
@@ -103,17 +135,19 @@ impl IpFlipRustApp {
             gateway_text: String::new(),
             current_settings_message: "Current settings will appear here.".to_string(),
             status_message: String::new(),
+            status_tone: StatusTone::Neutral,
             request_id: 0,
             interfaces_loading: false,
             tx,
             rx,
             profiles_path,
-            logo_texture,
         };
 
         if cfg!(target_os = "windows") && !is_windows_admin() {
-            app.status_message =
-                "Run the app as administrator before applying network settings.".to_string();
+            app.set_status(
+                "Run the app as administrator before applying network settings.",
+                StatusTone::Danger,
+            );
         }
 
         app.reload_interfaces_async();
@@ -122,6 +156,11 @@ impl IpFlipRustApp {
         }
 
         app
+    }
+
+    fn set_status(&mut self, message: impl Into<String>, tone: StatusTone) {
+        self.status_message = message.into();
+        self.status_tone = tone;
     }
 
     fn reload_interfaces_async(&mut self) {
@@ -147,7 +186,7 @@ impl IpFlipRustApp {
         }
 
         self.interfaces_loading = true;
-        self.status_message = "Loading network interfaces...".to_string();
+        self.set_status("Loading network interfaces...", StatusTone::Neutral);
 
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -162,13 +201,13 @@ impl IpFlipRustApp {
 
     fn request_interface_settings(&mut self, interface_name: String, fill_form: bool) {
         if interface_name.trim().is_empty() {
-            self.current_settings_message = "Current: Select an interface.".to_string();
+            self.current_settings_message = "Select an interface.".to_string();
             return;
         }
 
         self.request_id = self.request_id.saturating_add(1);
         let current_id = self.request_id;
-        self.current_settings_message = format!("Current ({}): reading...", interface_name);
+        self.current_settings_message = format!("Reading {}...", interface_name);
 
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -189,20 +228,25 @@ impl IpFlipRustApp {
         let gateway = self.gateway_text.trim().to_string();
 
         if interface.is_empty() {
-            self.status_message = "Interface is required.".to_string();
+            self.set_status("Interface is required.", StatusTone::Danger);
             return;
         }
         if ip.is_empty() || mask.is_empty() || gateway.is_empty() {
-            self.status_message =
-                "For static mode, interface, ip, mask, and gateway are required.".to_string();
+            self.set_status(
+                "For static mode, interface, ip, mask, and gateway are required.",
+                StatusTone::Danger,
+            );
             return;
         }
         if !is_ipv4(&ip) || !is_ipv4(&mask) || !is_ipv4(&gateway) {
-            self.status_message = "IP, mask, and gateway must be valid IPv4 values.".to_string();
+            self.set_status(
+                "IP, mask, and gateway must be valid IPv4 values.",
+                StatusTone::Danger,
+            );
             return;
         }
 
-        self.status_message = "Applying static IP...".to_string();
+        self.set_status("Applying static IP...", StatusTone::Neutral);
         let tx = self.tx.clone();
         let profile = IpProfile {
             net_interface: interface.clone(),
@@ -229,7 +273,7 @@ impl IpFlipRustApp {
             self.selected_interface.trim().to_string()
         };
 
-        self.status_message = "Applying DHCP...".to_string();
+        self.set_status("Applying DHCP...", StatusTone::Neutral);
         let tx = self.tx.clone();
         thread::spawn(move || {
             let result = change_ip_address(&interface, None, None, None);
@@ -249,15 +293,21 @@ impl IpFlipRustApp {
         let gateway = self.gateway_text.trim().to_string();
 
         if interface.is_empty() {
-            self.status_message = "Interface is required.".to_string();
+            self.set_status("Interface is required.", StatusTone::Danger);
             return;
         }
         if ip.is_empty() || mask.is_empty() || gateway.is_empty() {
-            self.status_message = "To save, interface, ip, mask, and gateway are required.".to_string();
+            self.set_status(
+                "To save, interface, ip, mask, and gateway are required.",
+                StatusTone::Danger,
+            );
             return;
         }
         if !is_ipv4(&ip) || !is_ipv4(&mask) || !is_ipv4(&gateway) {
-            self.status_message = "IP, mask, and gateway must be valid IPv4 values.".to_string();
+            self.set_status(
+                "IP, mask, and gateway must be valid IPv4 values.",
+                StatusTone::Danger,
+            );
             return;
         }
 
@@ -269,7 +319,7 @@ impl IpFlipRustApp {
         };
 
         self.add_profile(profile);
-        self.status_message = "Configuration saved.".to_string();
+        self.set_status("Configuration saved.", StatusTone::Success);
     }
 
     fn add_profile(&mut self, profile: IpProfile) {
@@ -286,6 +336,11 @@ impl IpFlipRustApp {
             self.interfaces
                 .sort_by_key(|n| interface_sort_key_with_categories(&categories, n));
         }
+    }
+
+    fn remove_profile(&mut self, profile: &IpProfile) {
+        self.profiles.retain(|p| p != profile);
+        save_profiles(&self.profiles_path, &self.profiles);
     }
 
     fn process_worker_messages(&mut self) {
@@ -363,12 +418,12 @@ impl IpFlipRustApp {
                         };
 
                         self.current_settings_message = format!(
-                            "Current ({}, {})\nIP: {}\nMask: {}\nGateway: {}",
+                            "{} · {}\nIP {}\nMask {}\nGateway {}",
                             interface_name, mode, ip_text, mask_text, gateway_text
                         );
                     } else {
                         self.current_settings_message =
-                            format!("Current ({}): unavailable", interface_name);
+                            format!("{}: unavailable", interface_name);
                     }
                 }
                 WorkerMessage::ApplyCompleted {
@@ -381,11 +436,11 @@ impl IpFlipRustApp {
                         if let Some(profile) = profile_to_save {
                             self.add_profile(profile);
                         }
-                        self.status_message = success_message;
+                        self.set_status(success_message, StatusTone::Success);
                         self.request_interface_settings(interface_name, true);
                     }
                     Err(err) => {
-                        self.status_message = err;
+                        self.set_status(err, StatusTone::Danger);
                     }
                 },
             }
@@ -393,166 +448,418 @@ impl IpFlipRustApp {
     }
 }
 
+// ---------- UI helpers ----------
+
+fn section_frame() -> Frame {
+    Frame::new()
+        .fill(palette::SURFACE)
+        .stroke(Stroke::new(1.0, palette::BORDER))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(egui::Margin::same(18))
+}
+
+fn pill_button(text: &str, fill: Color32, text_color: Color32) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).strong().color(text_color).size(14.0))
+        .fill(fill)
+        .corner_radius(CornerRadius::same(8))
+        .min_size(Vec2::new(0.0, 36.0))
+}
+
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .color(palette::TEXT_MUTED)
+            .size(12.0)
+            .strong(),
+    );
+}
+
+fn status_colors(tone: StatusTone) -> (Color32, Color32) {
+    match tone {
+        StatusTone::Neutral => (palette::SURFACE_ALT, palette::TEXT_SECONDARY),
+        StatusTone::Success => (palette::SUCCESS_BG, palette::SUCCESS),
+        StatusTone::Danger => (palette::DANGER_BG, palette::DANGER),
+    }
+}
+
 impl App for IpFlipRustApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_worker_messages();
 
-        let panel_fill = Color32::from_rgb(49, 51, 71);
-        let window_fill = Color32::from_rgb(32, 34, 49);
-        let text_primary = Color32::from_rgb(247, 247, 242);
-        let text_secondary = Color32::from_rgb(189, 194, 209);
-
+        // ---------- Global style ----------
         let mut style = (*ctx.style()).clone();
-        style.visuals.window_fill = window_fill;
-        style.visuals.panel_fill = window_fill;
-        style.visuals.override_text_color = Some(text_primary);
+        style.visuals.window_fill = palette::BG;
+        style.visuals.panel_fill = palette::BG;
+        style.visuals.override_text_color = Some(palette::TEXT_PRIMARY);
+        style.visuals.widgets.noninteractive.bg_fill = palette::SURFACE;
+        style.visuals.widgets.inactive.bg_fill = palette::SURFACE_ALT;
+        style.visuals.widgets.inactive.weak_bg_fill = palette::SURFACE_ALT;
+        style.visuals.widgets.hovered.bg_fill = palette::ELEVATED;
+        style.visuals.widgets.hovered.weak_bg_fill = palette::ELEVATED;
+        style.visuals.widgets.active.bg_fill = palette::ELEVATED;
+        style.visuals.widgets.inactive.corner_radius = CornerRadius::same(8);
+        style.visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
+        style.visuals.widgets.active.corner_radius = CornerRadius::same(8);
+        style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, palette::BORDER);
+        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette::ACCENT);
+        style.visuals.selection.bg_fill = palette::ACCENT_STRONG.linear_multiply(0.55);
+        style.visuals.selection.stroke = Stroke::new(1.0, palette::ACCENT);
+        style.spacing.item_spacing = Vec2::new(10.0, 10.0);
+        style.spacing.button_padding = Vec2::new(14.0, 8.0);
         ctx.set_style(style);
 
+        // ---------- Header ----------
+        egui::TopBottomPanel::top("header")
+            .frame(
+                Frame::new()
+                    .fill(palette::BG)
+                    .inner_margin(egui::Margin::symmetric(20, 16)),
+            )
+            .show_separator_line(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("ipFlip")
+                                .color(palette::TEXT_PRIMARY)
+                                .size(22.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new("Network profile manager")
+                                .color(palette::TEXT_MUTED)
+                                .size(13.0),
+                        );
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let admin = !cfg!(target_os = "windows") || is_windows_admin();
+                        let (bg, fg, text) = if admin {
+                            (palette::SUCCESS_BG, palette::SUCCESS, "Administrator")
+                        } else {
+                            (palette::DANGER_BG, palette::DANGER, "Not elevated")
+                        };
+                        Frame::new()
+                            .fill(bg)
+                            .corner_radius(CornerRadius::same(20))
+                            .inner_margin(egui::Margin::symmetric(12, 6))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(text).color(fg).size(12.0).strong());
+                            });
+                    });
+                });
+            });
+
+        // ---------- Body ----------
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(window_fill).inner_margin(egui::Margin::same(16)))
+            .frame(
+                Frame::new()
+                    .fill(palette::BG)
+                    .inner_margin(egui::Margin::symmetric(20, 4)),
+            )
             .show(ctx, |ui| {
                 ui.columns(2, |columns| {
-                    Frame::new()
-                        .fill(panel_fill)
-                        .corner_radius(egui::CornerRadius::same(10))
-                        .inner_margin(egui::Margin::same(12))
-                        .show(&mut columns[0], |ui| {
-                            ui.label(RichText::new("Saved Profiles").strong().size(20.0));
-                            ui.add_space(8.0);
-
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                for profile in self.profiles.clone() {
-                                    let text = format!(
-                                        "{} | {}\nMask: {}  Gateway: {}",
-                                        profile.net_interface, profile.ip, profile.mask, profile.gateway
-                                    );
-                                    let response = ui.add_sized(
-                                        [ui.available_width(), 68.0],
-                                        egui::Button::new(RichText::new(text).color(text_primary)),
-                                    );
-
-                                    if response.clicked() {
-                                        self.selected_interface = profile.net_interface.clone();
-                                        self.ip_text = profile.ip.clone();
-                                        self.mask_text = profile.mask.clone();
-                                        self.gateway_text = profile.gateway.clone();
-                                        self.status_message = "Loaded saved profile into form.".to_string();
-                                    }
-
-                                    if response.double_clicked() {
-                                        self.selected_interface = profile.net_interface.clone();
-                                        self.ip_text = profile.ip.clone();
-                                        self.mask_text = profile.mask.clone();
-                                        self.gateway_text = profile.gateway.clone();
-                                        self.apply_static_async();
-                                    }
-                                }
-                            });
-                        });
-
-                    Frame::new()
-                        .fill(panel_fill)
-                        .corner_radius(egui::CornerRadius::same(10))
-                        .inner_margin(egui::Margin::same(12))
-                        .show(&mut columns[1], |ui| {
-                            ui.label(RichText::new("Apply Network Settings").strong().size(20.0));
-                            ui.add_space(8.0);
-
-                            let mut selected_changed = false;
-                            egui::ComboBox::from_id_salt("interface_spinner")
-                                .selected_text(if self.selected_interface.is_empty() {
-                                    "Select interface".to_string()
-                                } else {
-                                    self.selected_interface.clone()
-                                })
-                                .width(ui.available_width())
-                                .show_ui(ui, |ui| {
-                                    for interface in self.interfaces.clone() {
-                                        let response = ui.selectable_value(
-                                            &mut self.selected_interface,
-                                            interface.clone(),
-                                            interface,
-                                        );
-                                        if response.changed() {
-                                            selected_changed = true;
-                                        }
-                                    }
-                                });
-
-                            if selected_changed {
-                                self.request_interface_settings(self.selected_interface.clone(), true);
-                            }
-
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(self.current_settings_message.clone()).color(text_secondary));
-                            ui.add_space(8.0);
-
-                            if self.mask_text.is_empty() && !self.ip_text.trim().is_empty() {
-                                self.mask_text = "255.255.255.0".to_string();
-                            }
-
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.ip_text)
-                                    .hint_text("IP")
-                                    .desired_width(ui.available_width()),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.mask_text)
-                                    .hint_text("Mask")
-                                    .desired_width(ui.available_width()),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.gateway_text)
-                                    .hint_text("Gateway")
-                                    .desired_width(ui.available_width()),
-                            );
-
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                let static_btn = egui::Button::new(
-                                    RichText::new("Apply Static IP").strong().color(Color32::from_rgb(28, 31, 41)),
-                                )
-                                .fill(Color32::from_rgb(79, 250, 122));
-                                if ui.add(static_btn).clicked() {
-                                    self.apply_static_async();
-                                }
-
-                                let save_btn = egui::Button::new(
-                                    RichText::new("Save profile").strong().color(Color32::from_rgb(28, 31, 41)),
-                                )
-                                .fill(Color32::from_rgb(140, 232, 252));
-                                if ui.add(save_btn).clicked() {
-                                    self.save_profile();
-                                }
-
-                                let dhcp_btn = egui::Button::new(
-                                    RichText::new("Set DHCP(Automatic IP)")
-                                        .strong()
-                                        .color(Color32::from_rgb(28, 31, 41)),
-                                )
-                                .fill(Color32::from_rgb(255, 184, 107));
-                                if ui.add(dhcp_btn).clicked() {
-                                    self.apply_dhcp_async();
-                                }
-                            });
-
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(self.status_message.clone()).color(text_primary));
+                    // ===== Left: saved profiles =====
+                    section_frame().show(&mut columns[0], |ui| {
+                        ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(
-                                    "Note: Changing IP settings on Windows usually requires running as administrator.",
-                                )
-                                .color(text_secondary),
+                                RichText::new("Saved Profiles")
+                                    .color(palette::TEXT_PRIMARY)
+                                    .size(17.0)
+                                    .strong(),
                             );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                Frame::new()
+                                    .fill(palette::SURFACE_ALT)
+                                    .corner_radius(CornerRadius::same(10))
+                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(format!("{}", self.profiles.len()))
+                                                .color(palette::TEXT_SECONDARY)
+                                                .size(12.0)
+                                                .strong(),
+                                        );
+                                    });
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("Click to load into the form · double-click to apply")
+                                .color(palette::TEXT_MUTED)
+                                .size(11.5),
+                        );
+                        ui.add_space(10.0);
 
-                            ui.add_space(12.0);
-                            if let Some(texture) = &self.logo_texture {
-                                let width = ui.available_width().min(240.0);
-                                let size = texture.size_vec2();
-                                let ratio = if size.x > 0.0 { size.y / size.x } else { 1.0 };
-                                ui.image((texture.id(), egui::vec2(width, width * ratio)));
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if self.profiles.is_empty() {
+                                    ui.add_space(20.0);
+                                    ui.vertical_centered(|ui| {
+                                        ui.label(
+                                            RichText::new("No saved profiles yet")
+                                                .color(palette::TEXT_MUTED)
+                                                .italics(),
+                                        );
+                                    });
+                                }
+
+                                let mut profile_to_delete: Option<IpProfile> = None;
+
+                                for (idx, profile) in self.profiles.clone().into_iter().enumerate() {
+                                    ui.push_id(idx, |ui| {
+                                        let mut delete_clicked = false;
+
+                                        // Fixed row height keeps every card the same size
+                                        // regardless of text length, so cards never grow.
+                                        let row_height = 68.0;
+
+                                        let frame_response = Frame::new()
+                                            .fill(palette::SURFACE_ALT)
+                                            .stroke(Stroke::new(1.0, palette::BORDER))
+                                            .corner_radius(CornerRadius::same(10))
+                                            .inner_margin(egui::Margin::symmetric(12, 10))
+                                            .show(ui, |ui| {
+                                                ui.set_min_height(row_height);
+                                                ui.horizontal(|ui| {
+                                                    // Anchor the delete button to the right
+                                                    // edge FIRST, in its own right-to-left
+                                                    // layout. Its x-position is then fixed
+                                                    // and cannot be pushed around by however
+                                                    // wide the text block ends up being.
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(egui::Align::Center),
+                                                        |ui| {
+                                                            let delete_btn = egui::Button::new(
+                                                                RichText::new("✕")
+                                                                    .color(palette::DANGER)
+                                                                    .size(13.0),
+                                                            )
+                                                            .fill(palette::DANGER_BG)
+                                                            .corner_radius(CornerRadius::same(7));
+                                                            if ui
+                                                                .add_sized([28.0, 28.0], delete_btn)
+                                                                .clicked()
+                                                            {
+                                                                delete_clicked = true;
+                                                            }
+
+                                                            // Remaining space is used for the
+                                                            // text column. Truncate long lines
+                                                            // instead of letting them overflow
+                                                            // and grow the row.
+                                                            ui.vertical(|ui| {
+                                                                ui.set_width(ui.available_width());
+
+                                                                ui.label(
+                                                                    RichText::new(&profile.net_interface)
+                                                                        .color(palette::TEXT_PRIMARY)
+                                                                        .strong()
+                                                                        .size(14.0),
+                                                                );
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        RichText::new(&profile.ip)
+                                                                            .color(palette::ACCENT)
+                                                                            .size(13.0)
+                                                                            .monospace(),
+                                                                    )
+                                                                    .truncate(),
+                                                                );
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        RichText::new(format!(
+                                                                            "mask {}  ·  gw {}",
+                                                                            profile.mask, profile.gateway
+                                                                        ))
+                                                                        .color(palette::TEXT_MUTED)
+                                                                        .size(11.5)
+                                                                        .monospace(),
+                                                                    )
+                                                                    .truncate(),
+                                                                );
+                                                            });
+                                                        },
+                                                    );
+                                                });
+                                            })
+                                            .response;
+
+                                        if delete_clicked {
+                                            profile_to_delete = Some(profile.clone());
+                                        } else {
+                                            let row = ui.interact(
+                                                frame_response.rect,
+                                                ui.id().with("row"),
+                                                egui::Sense::click(),
+                                            );
+
+                                            if row.clicked() {
+                                                self.selected_interface = profile.net_interface.clone();
+                                                self.ip_text = profile.ip.clone();
+                                                self.mask_text = profile.mask.clone();
+                                                self.gateway_text = profile.gateway.clone();
+                                                self.set_status(
+                                                    "Loaded saved profile into form.",
+                                                    StatusTone::Neutral,
+                                                );
+                                            }
+                                            if row.double_clicked() {
+                                                self.selected_interface = profile.net_interface.clone();
+                                                self.ip_text = profile.ip.clone();
+                                                self.mask_text = profile.mask.clone();
+                                                self.gateway_text = profile.gateway.clone();
+                                                self.apply_static_async();
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(8.0);
+                                }
+
+                                if let Some(profile) = profile_to_delete {
+                                    self.remove_profile(&profile);
+                                    self.set_status("Profile deleted.", StatusTone::Neutral);
+                                }
+                            });
+                    });
+
+                    // ===== Right: apply settings =====
+                    section_frame().show(&mut columns[1], |ui| {
+                        ui.label(
+                            RichText::new("Network Settings")
+                                .color(palette::TEXT_PRIMARY)
+                                .size(17.0)
+                                .strong(),
+                        );
+                        ui.add_space(12.0);
+
+                        field_label(ui, "INTERFACE");
+                        ui.add_space(4.0);
+                        let mut selected_changed = false;
+                        egui::ComboBox::from_id_salt("interface_spinner")
+                            .selected_text(if self.selected_interface.is_empty() {
+                                "Select interface".to_string()
+                            } else {
+                                self.selected_interface.clone()
+                            })
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for interface in self.interfaces.clone() {
+                                    let response = ui.selectable_value(
+                                        &mut self.selected_interface,
+                                        interface.clone(),
+                                        interface,
+                                    );
+                                    if response.changed() {
+                                        selected_changed = true;
+                                    }
+                                }
+                            });
+
+                        if selected_changed {
+                            self.request_interface_settings(self.selected_interface.clone(), true);
+                        }
+
+                        ui.add_space(12.0);
+
+                        Frame::new()
+                            .fill(palette::SURFACE_ALT)
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                for (i, line) in self.current_settings_message.clone().lines().enumerate() {
+                                    let text = if i == 0 {
+                                        RichText::new(line).color(palette::TEXT_SECONDARY).strong().size(12.5)
+                                    } else {
+                                        RichText::new(line).color(palette::TEXT_MUTED).monospace().size(12.0)
+                                    };
+                                    ui.label(text);
+                                }
+                            });
+
+                        ui.add_space(14.0);
+
+                        if self.mask_text.is_empty() && !self.ip_text.trim().is_empty() {
+                            self.mask_text = "255.255.255.0".to_string();
+                        }
+
+                        field_label(ui, "IP ADDRESS");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.ip_text)
+                                .hint_text("e.g. 192.168.1.50")
+                                .desired_width(ui.available_width())
+                                .margin(egui::Margin::symmetric(10, 8)),
+                        );
+                        ui.add_space(6.0);
+
+                        field_label(ui, "SUBNET MASK");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.mask_text)
+                                .hint_text("e.g. 255.255.255.0")
+                                .desired_width(ui.available_width())
+                                .margin(egui::Margin::symmetric(10, 8)),
+                        );
+                        ui.add_space(6.0);
+
+                        field_label(ui, "GATEWAY");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.gateway_text)
+                                .hint_text("e.g. 192.168.1.1")
+                                .desired_width(ui.available_width())
+                                .margin(egui::Margin::symmetric(10, 8)),
+                        );
+
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            let dark_on_accent = Color32::from_rgb(14, 16, 22);
+                            if ui
+                                .add(pill_button("Apply Static IP", palette::ACCENT, dark_on_accent))
+                                .clicked()
+                            {
+                                self.apply_static_async();
+                            }
+                            if ui
+                                .add(pill_button("Save Profile", palette::INFO, dark_on_accent))
+                                .clicked()
+                            {
+                                self.save_profile();
+                            }
+                            if ui
+                                .add(pill_button("Use DHCP", palette::WARNING, dark_on_accent))
+                                .clicked()
+                            {
+                                self.apply_dhcp_async();
                             }
                         });
+
+                        ui.add_space(14.0);
+
+                        if !self.status_message.is_empty() {
+                            let (bg, fg) = status_colors(self.status_tone);
+                            Frame::new()
+                                .fill(bg)
+                                .corner_radius(CornerRadius::same(8))
+                                .inner_margin(egui::Margin::symmetric(12, 8))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(self.status_message.clone())
+                                            .color(fg)
+                                            .size(12.5),
+                                    );
+                                });
+                            ui.add_space(8.0);
+                        }
+
+                        ui.label(
+                            RichText::new(
+                                "Changing IP settings on Windows usually requires running as administrator.",
+                            )
+                            .color(palette::TEXT_MUTED)
+                            .size(11.0)
+                            .italics(),
+                        );
+                    });
                 });
             });
 
@@ -564,7 +871,7 @@ fn main() {
     ensure_windows_elevation();
 
     let scale = system_scale_factor();
-    let (w, h) = (1000.0 / scale, 800.0 / scale);
+    let (w, h) = (1040.0 / scale, 760.0 / scale);
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([w, h])
         .with_min_inner_size([w, h]);
@@ -577,7 +884,7 @@ fn main() {
     };
 
     let _ = eframe::run_native(
-        "ipFlip (Rust)",
+        "ipFlip",
         native_options,
         Box::new(|cc| Ok(Box::new(IpFlipRustApp::new(cc)))),
     );
@@ -986,13 +1293,6 @@ fn is_ipv4(value: &str) -> bool {
     }
 
     true
-}
-
-fn load_logo_texture(cc: &CreationContext<'_>) -> Option<TextureHandle> {
-    let image = image::load_from_memory(ICON_PNG).ok()?.to_rgba8();
-    let size = [image.width() as usize, image.height() as usize];
-    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &image);
-    Some(cc.egui_ctx.load_texture("ipflip-logo", color_image, egui::TextureOptions::LINEAR))
 }
 
 #[cfg(target_os = "windows")]
