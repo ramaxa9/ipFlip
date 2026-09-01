@@ -57,6 +57,8 @@ mod palette {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct IpProfile {
+    #[serde(default)]
+    name: String,
     net_interface: String,
     ip: String,
     mask: String,
@@ -75,6 +77,7 @@ enum WorkerMessage {
     InterfacesLoaded {
         interfaces: Vec<String>,
         categories: HashMap<String, u8>,
+        device_names: HashMap<String, String>,
     },
     SettingsLoaded {
         interface_name: String,
@@ -101,7 +104,9 @@ struct IpFlipRustApp {
     profiles: Vec<IpProfile>,
     interfaces: Vec<String>,
     interface_category_by_name: HashMap<String, u8>,
+    interface_device_name_by_name: HashMap<String, String>,
     selected_interface: String,
+    preset_name_text: String,
     ip_text: String,
     mask_text: String,
     gateway_text: String,
@@ -110,6 +115,7 @@ struct IpFlipRustApp {
     status_tone: StatusTone,
     request_id: u64,
     interfaces_loading: bool,
+    interface_details_loading: bool,
     tx: Sender<WorkerMessage>,
     rx: Receiver<WorkerMessage>,
     profiles_path: PathBuf,
@@ -127,11 +133,18 @@ impl IpFlipRustApp {
 
         let (tx, rx) = mpsc::channel();
 
+        let selected_profile_name = profiles
+            .first()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+
         let mut app = Self {
             profiles,
             interfaces: Vec::new(),
             interface_category_by_name: HashMap::new(),
+            interface_device_name_by_name: HashMap::new(),
             selected_interface,
+            preset_name_text: selected_profile_name,
             ip_text: String::new(),
             mask_text: String::new(),
             gateway_text: String::new(),
@@ -140,6 +153,7 @@ impl IpFlipRustApp {
             status_tone: StatusTone::Neutral,
             request_id: 0,
             interfaces_loading: false,
+            interface_details_loading: false,
             tx,
             rx,
             profiles_path,
@@ -163,6 +177,18 @@ impl IpFlipRustApp {
     fn set_status(&mut self, message: impl Into<String>, tone: StatusTone) {
         self.status_message = message.into();
         self.status_tone = tone;
+    }
+
+    fn sync_preset_name_from_selected(&mut self) {
+        let profile = self
+            .profiles
+            .iter()
+            .find(|p| p.net_interface == self.selected_interface);
+        self.preset_name_text = profile.map(|p| p.name.clone()).unwrap_or_default();
+    }
+
+    fn interface_selector_disabled(&self) -> bool {
+        self.interfaces_loading || self.interface_details_loading
     }
 
     fn reload_interfaces_async(&mut self) {
@@ -194,9 +220,11 @@ impl IpFlipRustApp {
         thread::spawn(move || {
             let interfaces = list_network_interfaces();
             let categories = load_interface_categories();
+            let device_names = load_interface_device_names();
             let _ = tx.send(WorkerMessage::InterfacesLoaded {
                 interfaces,
                 categories,
+                device_names,
             });
         });
     }
@@ -204,11 +232,13 @@ impl IpFlipRustApp {
     fn request_interface_settings(&mut self, interface_name: String, fill_form: bool) {
         if interface_name.trim().is_empty() {
             self.current_settings_message = "Select an interface.".to_string();
+            self.interface_details_loading = false;
             return;
         }
 
         self.request_id = self.request_id.saturating_add(1);
         let current_id = self.request_id;
+        self.interface_details_loading = true;
         self.current_settings_message = format!("Reading {}...", interface_name);
 
         let tx = self.tx.clone();
@@ -251,6 +281,7 @@ impl IpFlipRustApp {
         self.set_status("Applying static IP...", StatusTone::Neutral);
         let tx = self.tx.clone();
         let profile = IpProfile {
+            name: self.preset_name_text.trim().to_string(),
             net_interface: interface.clone(),
             ip: ip.clone(),
             mask: mask.clone(),
@@ -314,6 +345,7 @@ impl IpFlipRustApp {
         }
 
         let profile = IpProfile {
+            name: self.preset_name_text.trim().to_string(),
             net_interface: interface.clone(),
             ip,
             mask,
@@ -330,6 +362,7 @@ impl IpFlipRustApp {
         }
 
         self.profiles.push(profile.clone());
+        self.preset_name_text = profile.name.clone();
         save_profiles(&self.profiles_path, &self.profiles);
 
         if !profile.net_interface.is_empty() && !self.interfaces.contains(&profile.net_interface) {
@@ -351,9 +384,11 @@ impl IpFlipRustApp {
                 WorkerMessage::InterfacesLoaded {
                     mut interfaces,
                     categories,
+                    device_names,
                 } => {
                     self.interfaces_loading = false;
                     self.interface_category_by_name = categories;
+                    self.interface_device_name_by_name = device_names;
 
                     for p in &self.profiles {
                         if !p.net_interface.is_empty() && !interfaces.contains(&p.net_interface) {
@@ -389,6 +424,8 @@ impl IpFlipRustApp {
                     if self.selected_interface != interface_name {
                         continue;
                     }
+
+                    self.interface_details_loading = false;
 
                     if let Some(settings) = settings {
                         if fill_form {
@@ -565,302 +602,366 @@ impl App for IpFlipRustApp {
                     .inner_margin(egui::Margin::symmetric(20, 4)),
             )
             .show(ctx, |ui| {
-                ui.columns(2, |columns| {
-                    // ===== Left: saved profiles =====
-                    section_frame().show(&mut columns[0], |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Saved Profiles")
-                                    .color(palette::TEXT_PRIMARY)
-                                    .size(17.0)
-                                    .strong(),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.columns(2, |columns| {
+                            section_frame().show(&mut columns[0], |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Saved Profiles")
+                                            .color(palette::TEXT_PRIMARY)
+                                            .size(17.0)
+                                            .strong(),
+                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        Frame::new()
+                                            .fill(palette::SURFACE_ALT)
+                                            .corner_radius(CornerRadius::same(10))
+                                            .inner_margin(egui::Margin::symmetric(8, 3))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    RichText::new(format!("{}", self.profiles.len()))
+                                                        .color(palette::TEXT_SECONDARY)
+                                                        .size(12.0)
+                                                        .strong(),
+                                                );
+                                            });
+                                    });
+                                });
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("Click to load into the form · double-click to apply")
+                                        .color(palette::TEXT_MUTED)
+                                        .size(11.5),
+                                );
+                                ui.add_space(10.0);
+
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if self.profiles.is_empty() {
+                                            ui.add_space(20.0);
+                                            ui.vertical_centered(|ui| {
+                                                ui.label(
+                                                    RichText::new("No saved profiles yet")
+                                                        .color(palette::TEXT_MUTED)
+                                                        .italics(),
+                                                );
+                                            });
+                                        }
+
+                                        let mut profile_to_delete: Option<IpProfile> = None;
+
+                                        for (idx, profile) in self.profiles.clone().into_iter().enumerate() {
+                                            ui.push_id(idx, |ui| {
+                                                let mut delete_clicked = false;
+                                                let mut name_field_active = false;
+                                                let row_height = 68.0;
+
+                                                let frame_response = Frame::new()
+                                                    .fill(palette::SURFACE_ALT)
+                                                    .stroke(Stroke::new(1.0_f32, palette::BORDER))
+                                                    .corner_radius(CornerRadius::same(10))
+                                                    .inner_margin(egui::Margin::symmetric(12, 10))
+                                                    .show(ui, |ui| {
+                                                        ui.set_min_height(row_height);
+                                                        ui.horizontal(|ui| {
+                                                            ui.with_layout(
+                                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                                |ui| {
+                                                                    let delete_btn = egui::Button::new(
+                                                                        RichText::new("🗑")
+                                                                            .color(palette::DANGER)
+                                                                            .size(13.0),
+                                                                    )
+                                                                    .fill(palette::DANGER_BG)
+                                                                    .corner_radius(CornerRadius::same(7));
+                                                                    let delete_response = ui.add_sized([28.0, 28.0], delete_btn);
+                                                                    if delete_response.clicked() {
+                                                                        delete_clicked = true;
+                                                                    }
+
+                                                                    ui.vertical(|ui| {
+                                                                        ui.set_width(ui.available_width());
+                                                                        let mut editable_name = profile_label(&profile);
+                                                                        let name_response = ui.add(
+                                                                            egui::TextEdit::singleline(&mut editable_name)
+                                                                                .desired_width(ui.available_width())
+                                                                                .margin(egui::Margin::symmetric(12, 10))
+                                                                                .text_color(palette::TEXT_PRIMARY)
+                                                                                .hint_text(profile.net_interface.clone())
+                                                                        );
+                                                                        let name_rect = name_response.rect;
+                                                                        let pointer_on_name_field = ui.ctx().input(|i| {
+                                                                            i.pointer
+                                                                                .hover_pos()
+                                                                                .is_some_and(|pos| name_rect.contains(pos))
+                                                                        });
+                                                                        name_field_active = name_response.clicked()
+                                                                            || name_response.double_clicked()
+                                                                            || name_response.has_focus()
+                                                                            || pointer_on_name_field;
+                                                                        if name_response.changed() {
+                                                                            let new_name = editable_name.trim().to_string();
+                                                                            let normalized_name = if new_name == profile.net_interface {
+                                                                                String::new()
+                                                                            } else {
+                                                                                new_name
+                                                                            };
+                                                                            if self.profiles.get_mut(idx).map(|p| p.name = normalized_name.clone()).is_some() {
+                                                                                save_profiles(&self.profiles_path, &self.profiles);
+                                                                                if self.selected_interface == profile.net_interface {
+                                                                                    self.preset_name_text = normalized_name;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        ui.add(
+                                                                            egui::Label::new(
+                                                                                RichText::new(&profile.net_interface)
+                                                                                    .color(palette::TEXT_MUTED)
+                                                                                    .size(11.0),
+                                                                            )
+                                                                            .truncate(),
+                                                                        );
+                                                                        ui.add(
+                                                                            egui::Label::new(
+                                                                                RichText::new(&profile.ip)
+                                                                                    .color(palette::ACCENT)
+                                                                                    .size(13.0)
+                                                                                    .monospace(),
+                                                                            )
+                                                                            .truncate(),
+                                                                        );
+                                                                        ui.add(
+                                                                            egui::Label::new(
+                                                                                RichText::new(format!(
+                                                                                    "mask {}  ·  gw {}",
+                                                                                    profile.mask, profile.gateway
+                                                                                ))
+                                                                                .color(palette::TEXT_MUTED)
+                                                                                .size(11.5)
+                                                                                .monospace(),
+                                                                            )
+                                                                            .truncate(),
+                                                                        );
+                                                                    });
+                                                                },
+                                                            );
+                                                        });
+                                                    })
+                                                    .response;
+
+                                                let row_rect = egui::Rect::from_min_max(
+                                                    frame_response.rect.min,
+                                                    egui::pos2(frame_response.rect.right() - 40.0, frame_response.rect.bottom()),
+                                                );
+
+                                                if delete_clicked {
+                                                    profile_to_delete = Some(profile.clone());
+                                                } else {
+                                                    let row = ui.interact(
+                                                        row_rect,
+                                                        ui.id().with("row"),
+                                                        egui::Sense::click(),
+                                                    );
+
+                                                    if row.clicked() && !name_field_active {
+                                                        self.selected_interface = profile.net_interface.clone();
+                                                        self.preset_name_text = profile.name.clone();
+                                                        self.ip_text = profile.ip.clone();
+                                                        self.mask_text = profile.mask.clone();
+                                                        self.gateway_text = profile.gateway.clone();
+                                                        self.set_status(
+                                                            "Loaded saved profile into form.",
+                                                            StatusTone::Neutral,
+                                                        );
+                                                    }
+                                                    if row.double_clicked() && !name_field_active {
+                                                        self.selected_interface = profile.net_interface.clone();
+                                                        self.preset_name_text = profile.name.clone();
+                                                        self.ip_text = profile.ip.clone();
+                                                        self.mask_text = profile.mask.clone();
+                                                        self.gateway_text = profile.gateway.clone();
+                                                        self.apply_static_async();
+                                                    }
+                                                }
+                                            });
+                                            ui.add_space(8.0);
+                                        }
+
+                                        if let Some(profile) = profile_to_delete {
+                                            self.remove_profile(&profile);
+                                            self.set_status("Profile deleted.", StatusTone::Neutral);
+                                        }
+                                    });
+                            });
+
+                            section_frame().show(&mut columns[1], |ui| {
+                                ui.label(
+                                    RichText::new("Network Settings")
+                                        .color(palette::TEXT_PRIMARY)
+                                        .size(17.0)
+                                        .strong(),
+                                );
+                                ui.add_space(12.0);
+
+                                field_label(ui, "INTERFACE");
+                                ui.add_space(4.0);
+                                let mut selected_changed = false;
+                                let selector_disabled = self.interface_selector_disabled();
+                                ui.add_enabled_ui(!selector_disabled, |ui| {
+                                    egui::ComboBox::from_id_salt("interface_spinner")
+                                        .selected_text(if self.selected_interface.is_empty() {
+                                            "Select interface".to_string()
+                                        } else {
+                                            self.selected_interface.clone()
+                                        })
+                                        .width(ui.available_width())
+                                        .show_ui(ui, |ui| {
+                                            for interface in self.interfaces.clone() {
+                                                let device_name = self
+                                                    .interface_device_name_by_name
+                                                    .get(&interface)
+                                                    .cloned()
+                                                    .unwrap_or_default();
+                                                let label = if device_name.trim().is_empty() {
+                                                    interface.clone()
+                                                } else {
+                                                    format!("{}\n{}", interface, device_name)
+                                                };
+
+                                                let response = ui.selectable_value(
+                                                    &mut self.selected_interface,
+                                                    interface.clone(),
+                                                    RichText::new(label)
+                                                        .color(palette::TEXT_PRIMARY)
+                                                        .size(14.0),
+                                                );
+                                                if response.changed() {
+                                                    selected_changed = true;
+                                                }
+                                            }
+                                        });
+                                });
+
+                                if selected_changed {
+                                    self.sync_preset_name_from_selected();
+                                    self.request_interface_settings(self.selected_interface.clone(), true);
+                                }
+
+                                ui.add_space(12.0);
+
                                 Frame::new()
                                     .fill(palette::SURFACE_ALT)
                                     .corner_radius(CornerRadius::same(10))
-                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                    .inner_margin(egui::Margin::symmetric(12, 10))
                                     .show(ui, |ui| {
-                                        ui.label(
-                                            RichText::new(format!("{}", self.profiles.len()))
-                                                .color(palette::TEXT_SECONDARY)
-                                                .size(12.0)
-                                                .strong(),
-                                        );
-                                    });
-                            });
-                        });
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Click to load into the form · double-click to apply")
-                                .color(palette::TEXT_MUTED)
-                                .size(11.5),
-                        );
-                        ui.add_space(10.0);
-
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                if self.profiles.is_empty() {
-                                    ui.add_space(20.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            RichText::new("No saved profiles yet")
-                                                .color(palette::TEXT_MUTED)
-                                                .italics(),
-                                        );
-                                    });
-                                }
-
-                                let mut profile_to_delete: Option<IpProfile> = None;
-
-                                for (idx, profile) in self.profiles.clone().into_iter().enumerate() {
-                                    ui.push_id(idx, |ui| {
-                                        let mut delete_clicked = false;
-
-                                        // Fixed row height keeps every card the same size
-                                        // regardless of text length, so cards never grow.
-                                        let row_height = 68.0;
-
-                                        let frame_response = Frame::new()
-                                            .fill(palette::SURFACE_ALT)
-                                            .stroke(Stroke::new(1.0_f32, palette::BORDER))
-                                            .corner_radius(CornerRadius::same(10))
-                                            .inner_margin(egui::Margin::symmetric(12, 10))
-                                            .show(ui, |ui| {
-                                                ui.set_min_height(row_height);
-                                                ui.horizontal(|ui| {
-                                                    ui.with_layout(
-                                                        egui::Layout::right_to_left(egui::Align::Center),
-                                                        |ui| {
-                                                            let delete_btn = egui::Button::new(
-                                                                RichText::new("🗑")
-                                                                    .color(palette::DANGER)
-                                                                    .size(13.0),
-                                                            )
-                                                            .fill(palette::DANGER_BG)
-                                                            .corner_radius(CornerRadius::same(7));
-                                                            let delete_response = ui.add_sized([28.0, 28.0], delete_btn);
-                                                            if delete_response.clicked() {
-                                                                delete_clicked = true;
-                                                            }
-
-                                                            ui.vertical(|ui| {
-                                                                ui.set_width(ui.available_width());
-                                                                ui.label(
-                                                                    RichText::new(&profile.net_interface)
-                                                                        .color(palette::TEXT_PRIMARY)
-                                                                        .strong()
-                                                                        .size(14.0),
-                                                                );
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        RichText::new(&profile.ip)
-                                                                            .color(palette::ACCENT)
-                                                                            .size(13.0)
-                                                                            .monospace(),
-                                                                    )
-                                                                    .truncate(),
-                                                                );
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        RichText::new(format!(
-                                                                            "mask {}  ·  gw {}",
-                                                                            profile.mask, profile.gateway
-                                                                        ))
-                                                                        .color(palette::TEXT_MUTED)
-                                                                        .size(11.5)
-                                                                        .monospace(),
-                                                                    )
-                                                                    .truncate(),
-                                                                );
-                                                            });
-                                                        },
-                                                    );
-                                                });
-                                            })
-                                            .response;
-
-                                        let row_rect = egui::Rect::from_min_max(
-                                            frame_response.rect.min,
-                                            egui::pos2(frame_response.rect.right() - 40.0, frame_response.rect.bottom()),
-                                        );
-
-                                        if delete_clicked {
-                                            profile_to_delete = Some(profile.clone());
-                                        } else {
-                                            let row = ui.interact(
-                                                row_rect,
-                                                ui.id().with("row"),
-                                                egui::Sense::click(),
-                                            );
-
-                                            if row.clicked() {
-                                                self.selected_interface = profile.net_interface.clone();
-                                                self.ip_text = profile.ip.clone();
-                                                self.mask_text = profile.mask.clone();
-                                                self.gateway_text = profile.gateway.clone();
-                                                self.set_status(
-                                                    "Loaded saved profile into form.",
-                                                    StatusTone::Neutral,
-                                                );
-                                            }
-                                            if row.double_clicked() {
-                                                self.selected_interface = profile.net_interface.clone();
-                                                self.ip_text = profile.ip.clone();
-                                                self.mask_text = profile.mask.clone();
-                                                self.gateway_text = profile.gateway.clone();
-                                                self.apply_static_async();
-                                            }
+                                        for (i, line) in self.current_settings_message.clone().lines().enumerate() {
+                                            let text = if i == 0 {
+                                                RichText::new(line).color(palette::TEXT_SECONDARY).strong().size(12.5)
+                                            } else {
+                                                RichText::new(line).color(palette::TEXT_MUTED).monospace().size(12.0)
+                                            };
+                                            ui.label(text);
                                         }
                                     });
+
+                                ui.add_space(12.0);
+
+                                field_label(ui, "PRESET NAME");
+                                ui.add_space(4.0);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.preset_name_text)
+                                        .hint_text("")
+                                        .desired_width(ui.available_width())
+                                        .margin(egui::Margin::symmetric(10, 8)),
+                                );
+
+                                ui.add_space(14.0);
+
+                                if self.mask_text.is_empty() && !self.ip_text.trim().is_empty() {
+                                    self.mask_text = "255.255.255.0".to_string();
+                                }
+
+                                field_label(ui, "IP ADDRESS");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.ip_text)
+                                        .hint_text("e.g. 192.168.1.50")
+                                        .desired_width(ui.available_width())
+                                        .margin(egui::Margin::symmetric(10, 8)),
+                                );
+                                ui.add_space(6.0);
+
+                                field_label(ui, "SUBNET MASK");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.mask_text)
+                                        .hint_text("e.g. 255.255.255.0")
+                                        .desired_width(ui.available_width())
+                                        .margin(egui::Margin::symmetric(10, 8)),
+                                );
+                                ui.add_space(6.0);
+
+                                field_label(ui, "GATEWAY");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.gateway_text)
+                                        .hint_text("e.g. 192.168.1.1")
+                                        .desired_width(ui.available_width())
+                                        .margin(egui::Margin::symmetric(10, 8)),
+                                );
+
+                                ui.add_space(14.0);
+                                ui.horizontal(|ui| {
+                                    let dark_on_accent = Color32::from_rgb(14, 16, 22);
+                                    if ui
+                                        .add(pill_button_with_icon("⚙", "Apply Static IP", palette::ACCENT, dark_on_accent))
+                                        .clicked()
+                                    {
+                                        self.apply_static_async();
+                                    }
+                                    if ui
+                                        .add(pill_button_with_icon("💾", "Save Profile", palette::INFO, dark_on_accent))
+                                        .clicked()
+                                    {
+                                        self.save_profile();
+                                    }
+                                    if ui
+                                        .add(pill_button_with_icon("🔄", "Use DHCP", palette::WARNING, dark_on_accent))
+                                        .clicked()
+                                    {
+                                        self.apply_dhcp_async();
+                                    }
+                                });
+
+                                ui.add_space(14.0);
+
+                                if !self.status_message.is_empty() {
+                                    let (bg, fg) = status_colors(self.status_tone);
+                                    Frame::new()
+                                        .fill(bg)
+                                        .corner_radius(CornerRadius::same(8))
+                                        .inner_margin(egui::Margin::symmetric(12, 8))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new(self.status_message.clone())
+                                                    .color(fg)
+                                                    .size(12.5),
+                                            );
+                                        });
                                     ui.add_space(8.0);
                                 }
 
-                                if let Some(profile) = profile_to_delete {
-                                    self.remove_profile(&profile);
-                                    self.set_status("Profile deleted.", StatusTone::Neutral);
-                                }
+                                ui.label(
+                                    RichText::new(
+                                        "Changing IP settings on Windows usually requires running as administrator.",
+                                    )
+                                    .color(palette::TEXT_MUTED)
+                                    .size(11.0)
+                                    .italics(),
+                                );
                             });
-                    });
-
-                    // ===== Right: apply settings =====
-                    section_frame().show(&mut columns[1], |ui| {
-                        ui.label(
-                            RichText::new("Network Settings")
-                                .color(palette::TEXT_PRIMARY)
-                                .size(17.0)
-                                .strong(),
-                        );
-                        ui.add_space(12.0);
-
-                        field_label(ui, "INTERFACE");
-                        ui.add_space(4.0);
-                        let mut selected_changed = false;
-                        egui::ComboBox::from_id_salt("interface_spinner")
-                            .selected_text(if self.selected_interface.is_empty() {
-                                "Select interface".to_string()
-                            } else {
-                                self.selected_interface.clone()
-                            })
-                            .width(ui.available_width())
-                            .show_ui(ui, |ui| {
-                                for interface in self.interfaces.clone() {
-                                    let response = ui.selectable_value(
-                                        &mut self.selected_interface,
-                                        interface.clone(),
-                                        interface,
-                                    );
-                                    if response.changed() {
-                                        selected_changed = true;
-                                    }
-                                }
-                            });
-
-                        if selected_changed {
-                            self.request_interface_settings(self.selected_interface.clone(), true);
-                        }
-
-                        ui.add_space(12.0);
-
-                        Frame::new()
-                            .fill(palette::SURFACE_ALT)
-                            .corner_radius(CornerRadius::same(10))
-                            .inner_margin(egui::Margin::symmetric(12, 10))
-                            .show(ui, |ui| {
-                                for (i, line) in self.current_settings_message.clone().lines().enumerate() {
-                                    let text = if i == 0 {
-                                        RichText::new(line).color(palette::TEXT_SECONDARY).strong().size(12.5)
-                                    } else {
-                                        RichText::new(line).color(palette::TEXT_MUTED).monospace().size(12.0)
-                                    };
-                                    ui.label(text);
-                                }
-                            });
-
-                        ui.add_space(14.0);
-
-                        if self.mask_text.is_empty() && !self.ip_text.trim().is_empty() {
-                            self.mask_text = "255.255.255.0".to_string();
-                        }
-
-                        field_label(ui, "IP ADDRESS");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.ip_text)
-                                .hint_text("e.g. 192.168.1.50")
-                                .desired_width(ui.available_width())
-                                .margin(egui::Margin::symmetric(10, 8)),
-                        );
-                        ui.add_space(6.0);
-
-                        field_label(ui, "SUBNET MASK");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.mask_text)
-                                .hint_text("e.g. 255.255.255.0")
-                                .desired_width(ui.available_width())
-                                .margin(egui::Margin::symmetric(10, 8)),
-                        );
-                        ui.add_space(6.0);
-
-                        field_label(ui, "GATEWAY");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.gateway_text)
-                                .hint_text("e.g. 192.168.1.1")
-                                .desired_width(ui.available_width())
-                                .margin(egui::Margin::symmetric(10, 8)),
-                        );
-
-                        ui.add_space(14.0);
-                        ui.horizontal(|ui| {
-                            let dark_on_accent = Color32::from_rgb(14, 16, 22);
-                            if ui
-                                .add(pill_button_with_icon("⚙", "Apply Static IP", palette::ACCENT, dark_on_accent))
-                                .clicked()
-                            {
-                                self.apply_static_async();
-                            }
-                            if ui
-                                .add(pill_button_with_icon("💾", "Save Profile", palette::INFO, dark_on_accent))
-                                .clicked()
-                            {
-                                self.save_profile();
-                            }
-                            if ui
-                                .add(pill_button_with_icon("🔄", "Use DHCP", palette::WARNING, dark_on_accent))
-                                .clicked()
-                            {
-                                self.apply_dhcp_async();
-                            }
                         });
-
-                        ui.add_space(14.0);
-
-                        if !self.status_message.is_empty() {
-                            let (bg, fg) = status_colors(self.status_tone);
-                            Frame::new()
-                                .fill(bg)
-                                .corner_radius(CornerRadius::same(8))
-                                .inner_margin(egui::Margin::symmetric(12, 8))
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        RichText::new(self.status_message.clone())
-                                            .color(fg)
-                                            .size(12.5),
-                                    );
-                                });
-                            ui.add_space(8.0);
-                        }
-
-                        ui.label(
-                            RichText::new(
-                                "Changing IP settings on Windows usually requires running as administrator.",
-                            )
-                            .color(palette::TEXT_MUTED)
-                            .size(11.0)
-                            .italics(),
-                        );
                     });
-                });
             });
 
         ctx.request_repaint();
@@ -869,12 +970,49 @@ impl App for IpFlipRustApp {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_top_center_position;
+    use super::{compute_top_center_position, IpFlipRustApp, IpProfile};
+    use std::sync::mpsc;
 
     #[test]
     fn compute_top_center_position_places_window_near_screen_center_top() {
         let pos = compute_top_center_position(1040.0, 760.0, 1920, 1080);
         assert_eq!(pos, (440.0, 0.0));
+    }
+
+    #[test]
+    fn interface_selector_is_disabled_while_reading_details() {
+        let (tx, rx) = mpsc::channel();
+        let app = IpFlipRustApp {
+            profiles: vec![],
+            interfaces: vec![],
+            interface_category_by_name: Default::default(),
+            interface_device_name_by_name: Default::default(),
+            selected_interface: String::new(),
+            ip_text: String::new(),
+            mask_text: String::new(),
+            gateway_text: String::new(),
+            preset_name_text: String::new(),
+            current_settings_message: String::new(),
+            status_message: String::new(),
+            status_tone: super::StatusTone::Neutral,
+            request_id: 0,
+            interfaces_loading: false,
+            interface_details_loading: true,
+            tx,
+            rx,
+            profiles_path: Default::default(),
+        };
+
+        assert!(app.interface_selector_disabled());
+    }
+
+    #[test]
+    fn legacy_profile_json_without_name_deserializes() {
+        let raw = r#"[{"net_interface":"Ethernet","ip":"192.168.1.10","mask":"255.255.255.0","gateway":"192.168.1.1"}]"#;
+        let profiles: Vec<IpProfile> = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "");
     }
 }
 
@@ -908,7 +1046,8 @@ fn main() {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([w, h])
-        .with_min_inner_size([w, h])
+        .with_min_inner_size([w * 0.8, 520.0])
+        .with_resizable(true)
         .with_position([x, y]);
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
@@ -974,6 +1113,7 @@ fn load_profiles(path: &Path) -> Vec<IpProfile> {
 
     let mut out = Vec::new();
     for item in arr {
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
         let interface_name = item
             .get("net_interface")
             .or_else(|| item.get("interface"))
@@ -1001,6 +1141,7 @@ fn load_profiles(path: &Path) -> Vec<IpProfile> {
         }
 
         out.push(IpProfile {
+            name,
             net_interface: interface_name,
             ip,
             mask,
@@ -1014,6 +1155,15 @@ fn load_profiles(path: &Path) -> Vec<IpProfile> {
 fn save_profiles(path: &Path, profiles: &[IpProfile]) {
     if let Ok(json) = serde_json::to_string_pretty(profiles) {
         let _ = fs::write(path, json);
+    }
+}
+
+fn profile_label(profile: &IpProfile) -> String {
+    let trimmed = profile.name.trim();
+    if trimmed.is_empty() {
+        profile.net_interface.clone()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -1108,6 +1258,59 @@ fn load_interface_categories() -> HashMap<String, u8> {
 
         let category = categorize_interface(obj);
         out.insert(name.trim().to_string(), category);
+    }
+
+    out
+}
+
+fn load_interface_device_names() -> HashMap<String, String> {
+    let command = "Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Select-Object Name, InterfaceDescription | ConvertTo-Json -Compress";
+
+    let output = match run_hidden_command("powershell", &["-NoProfile", "-Command", command]) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+
+    if !output.status.success() {
+        return HashMap::new();
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return HashMap::new();
+    }
+
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+
+    let rows: Vec<Value> = if let Some(list) = parsed.as_array() {
+        list.clone()
+    } else {
+        vec![parsed]
+    };
+
+    let mut out = HashMap::new();
+    for row in rows {
+        let Some(obj) = row.as_object() else {
+            continue;
+        };
+
+        let Some(name) = obj.get("Name").and_then(Value::as_str) else {
+            continue;
+        };
+
+        let device_name = obj
+            .get("InterfaceDescription")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        if !name.trim().is_empty() && !device_name.is_empty() {
+            out.insert(name.trim().to_string(), device_name);
+        }
     }
 
     out
