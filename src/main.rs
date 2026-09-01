@@ -19,6 +19,8 @@ use serde_json::Value;
 use windows_sys::Win32::UI::Shell::IsUserAnAdmin;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -453,16 +455,21 @@ impl IpFlipRustApp {
 fn section_frame() -> Frame {
     Frame::new()
         .fill(palette::SURFACE)
-        .stroke(Stroke::new(1.0, palette::BORDER))
+        .stroke(Stroke::new(1.0_f32, palette::BORDER))
         .corner_radius(CornerRadius::same(14))
         .inner_margin(egui::Margin::same(18))
 }
 
-fn pill_button(text: &str, fill: Color32, text_color: Color32) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).strong().color(text_color).size(14.0))
-        .fill(fill)
-        .corner_radius(CornerRadius::same(8))
-        .min_size(Vec2::new(0.0, 36.0))
+fn pill_button_with_icon(icon: &str, text: &str, fill: Color32, text_color: Color32) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(format!("{} {}", icon, text))
+            .strong()
+            .color(text_color)
+            .size(14.0),
+    )
+    .fill(fill)
+    .corner_radius(CornerRadius::same(8))
+    .min_size(Vec2::new(0.0, 36.0))
 }
 
 fn field_label(ui: &mut egui::Ui, text: &str) {
@@ -500,10 +507,10 @@ impl App for IpFlipRustApp {
         style.visuals.widgets.inactive.corner_radius = CornerRadius::same(8);
         style.visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
         style.visuals.widgets.active.corner_radius = CornerRadius::same(8);
-        style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, palette::BORDER);
-        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette::ACCENT);
+        style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, palette::BORDER);
+        style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, palette::ACCENT);
         style.visuals.selection.bg_fill = palette::ACCENT_STRONG.linear_multiply(0.55);
-        style.visuals.selection.stroke = Stroke::new(1.0, palette::ACCENT);
+        style.visuals.selection.stroke = Stroke::new(1.0_f32, palette::ACCENT);
         style.spacing.item_spacing = Vec2::new(10.0, 10.0);
         style.spacing.button_padding = Vec2::new(14.0, 8.0);
         ctx.set_style(style);
@@ -609,30 +616,23 @@ impl App for IpFlipRustApp {
 
                                 for (idx, profile) in self.profiles.clone().into_iter().enumerate() {
                                     ui.push_id(idx, |ui| {
-                                        let mut delete_clicked = false;
-
                                         // Fixed row height keeps every card the same size
                                         // regardless of text length, so cards never grow.
                                         let row_height = 68.0;
 
                                         let frame_response = Frame::new()
                                             .fill(palette::SURFACE_ALT)
-                                            .stroke(Stroke::new(1.0, palette::BORDER))
+                                            .stroke(Stroke::new(1.0_f32, palette::BORDER))
                                             .corner_radius(CornerRadius::same(10))
                                             .inner_margin(egui::Margin::symmetric(12, 10))
                                             .show(ui, |ui| {
                                                 ui.set_min_height(row_height);
                                                 ui.horizontal(|ui| {
-                                                    // Anchor the delete button to the right
-                                                    // edge FIRST, in its own right-to-left
-                                                    // layout. Its x-position is then fixed
-                                                    // and cannot be pushed around by however
-                                                    // wide the text block ends up being.
                                                     ui.with_layout(
                                                         egui::Layout::right_to_left(egui::Align::Center),
                                                         |ui| {
                                                             let delete_btn = egui::Button::new(
-                                                                RichText::new("✕")
+                                                                RichText::new("🗑")
                                                                     .color(palette::DANGER)
                                                                     .size(13.0),
                                                             )
@@ -642,13 +642,9 @@ impl App for IpFlipRustApp {
                                                                 .add_sized([28.0, 28.0], delete_btn)
                                                                 .clicked()
                                                             {
-                                                                delete_clicked = true;
+                                                                profile_to_delete = Some(profile.clone());
                                                             }
 
-                                                            // Remaining space is used for the
-                                                            // text column. Truncate long lines
-                                                            // instead of letting them overflow
-                                                            // and grow the row.
                                                             ui.vertical(|ui| {
                                                                 ui.set_width(ui.available_width());
 
@@ -686,15 +682,13 @@ impl App for IpFlipRustApp {
                                             })
                                             .response;
 
-                                        if delete_clicked {
-                                            profile_to_delete = Some(profile.clone());
-                                        } else {
-                                            let row = ui.interact(
-                                                frame_response.rect,
-                                                ui.id().with("row"),
-                                                egui::Sense::click(),
-                                            );
+                                        let row = ui.interact(
+                                            frame_response.rect,
+                                            ui.id().with("row"),
+                                            egui::Sense::click(),
+                                        );
 
+                                        if !profile_to_delete.is_some() {
                                             if row.clicked() {
                                                 self.selected_interface = profile.net_interface.clone();
                                                 self.ip_text = profile.ip.clone();
@@ -814,19 +808,19 @@ impl App for IpFlipRustApp {
                         ui.horizontal(|ui| {
                             let dark_on_accent = Color32::from_rgb(14, 16, 22);
                             if ui
-                                .add(pill_button("Apply Static IP", palette::ACCENT, dark_on_accent))
+                                .add(pill_button_with_icon("⚙", "Apply Static IP", palette::ACCENT, dark_on_accent))
                                 .clicked()
                             {
                                 self.apply_static_async();
                             }
                             if ui
-                                .add(pill_button("Save Profile", palette::INFO, dark_on_accent))
+                                .add(pill_button_with_icon("💾", "Save Profile", palette::INFO, dark_on_accent))
                                 .clicked()
                             {
                                 self.save_profile();
                             }
                             if ui
-                                .add(pill_button("Use DHCP", palette::WARNING, dark_on_accent))
+                                .add(pill_button_with_icon("🔄", "Use DHCP", palette::WARNING, dark_on_accent))
                                 .clicked()
                             {
                                 self.apply_dhcp_async();
@@ -867,14 +861,49 @@ impl App for IpFlipRustApp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::compute_top_center_position;
+
+    #[test]
+    fn compute_top_center_position_places_window_near_screen_center_top() {
+        let pos = compute_top_center_position(1040.0, 760.0, 1920, 1080);
+        assert_eq!(pos, (440.0, 0.0));
+    }
+}
+
+fn compute_top_center_position(window_width: f32, _window_height: f32, screen_width: u32, _screen_height: u32) -> (f32, f32) {
+    let x = ((screen_width as f32 - window_width) / 2.0).max(0.0);
+    let y = 0.0;
+    (x, y)
+}
+
+fn primary_screen_size() -> (u32, u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let width = unsafe { GetSystemMetrics(0) } as u32;
+        let height = unsafe { GetSystemMetrics(1) } as u32;
+        return (width, height);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        (1920, 1080)
+    }
+}
+
 fn main() {
     ensure_windows_elevation();
 
     let scale = system_scale_factor();
     let (w, h) = (1040.0 / scale, 760.0 / scale);
+    let (screen_w, _screen_h) = primary_screen_size();
+    let (x, y) = compute_top_center_position(w, h, screen_w, _screen_h);
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([w, h])
-        .with_min_inner_size([w, h]);
+        .with_min_inner_size([w, h])
+        .with_position([x, y]);
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
     }
