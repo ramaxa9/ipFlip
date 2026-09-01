@@ -616,6 +616,8 @@ impl App for IpFlipRustApp {
 
                                 for (idx, profile) in self.profiles.clone().into_iter().enumerate() {
                                     ui.push_id(idx, |ui| {
+                                        let mut delete_clicked = false;
+
                                         // Fixed row height keeps every card the same size
                                         // regardless of text length, so cards never grow.
                                         let row_height = 68.0;
@@ -638,16 +640,13 @@ impl App for IpFlipRustApp {
                                                             )
                                                             .fill(palette::DANGER_BG)
                                                             .corner_radius(CornerRadius::same(7));
-                                                            if ui
-                                                                .add_sized([28.0, 28.0], delete_btn)
-                                                                .clicked()
-                                                            {
-                                                                profile_to_delete = Some(profile.clone());
+                                                            let delete_response = ui.add_sized([28.0, 28.0], delete_btn);
+                                                            if delete_response.clicked() {
+                                                                delete_clicked = true;
                                                             }
 
                                                             ui.vertical(|ui| {
                                                                 ui.set_width(ui.available_width());
-
                                                                 ui.label(
                                                                     RichText::new(&profile.net_interface)
                                                                         .color(palette::TEXT_PRIMARY)
@@ -682,13 +681,20 @@ impl App for IpFlipRustApp {
                                             })
                                             .response;
 
-                                        let row = ui.interact(
-                                            frame_response.rect,
-                                            ui.id().with("row"),
-                                            egui::Sense::click(),
+                                        let row_rect = egui::Rect::from_min_max(
+                                            frame_response.rect.min,
+                                            egui::pos2(frame_response.rect.right() - 40.0, frame_response.rect.bottom()),
                                         );
 
-                                        if !profile_to_delete.is_some() {
+                                        if delete_clicked {
+                                            profile_to_delete = Some(profile.clone());
+                                        } else {
+                                            let row = ui.interact(
+                                                row_rect,
+                                                ui.id().with("row"),
+                                                egui::Sense::click(),
+                                            );
+
                                             if row.clicked() {
                                                 self.selected_interface = profile.net_interface.clone();
                                                 self.ip_text = profile.ip.clone();
