@@ -1,5 +1,5 @@
 # ipFlip
-![screenshot](screenshot.png?) 
+![screenshot](screenshot.png) 
 ipFlip created  to quickly change ip address, with frequently used ip list
 
 * Requires admin privileges!
