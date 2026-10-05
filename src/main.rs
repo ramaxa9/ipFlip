@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, CornerRadius, Frame, RichText, Stroke, Vec2};
 use eframe::{App, CreationContext, NativeOptions};
@@ -113,6 +114,7 @@ struct IpFlipRustApp {
     current_settings_message: String,
     status_message: String,
     status_tone: StatusTone,
+    status_set_at: Option<Instant>,
     request_id: u64,
     interfaces_loading: bool,
     interface_details_loading: bool,
@@ -151,6 +153,7 @@ impl IpFlipRustApp {
             current_settings_message: "Current settings will appear here.".to_string(),
             status_message: String::new(),
             status_tone: StatusTone::Neutral,
+            status_set_at: None,
             request_id: 0,
             interfaces_loading: false,
             interface_details_loading: false,
@@ -177,6 +180,7 @@ impl IpFlipRustApp {
     fn set_status(&mut self, message: impl Into<String>, tone: StatusTone) {
         self.status_message = message.into();
         self.status_tone = tone;
+        self.status_set_at = Some(Instant::now());
     }
 
     fn sync_preset_name_from_selected(&mut self) {
@@ -187,7 +191,7 @@ impl IpFlipRustApp {
         self.preset_name_text = profile.map(|p| p.name.clone()).unwrap_or_default();
     }
 
-    fn interface_selector_disabled(&self) -> bool {
+    fn interface_read_in_progress(&self) -> bool {
         self.interfaces_loading || self.interface_details_loading
     }
 
@@ -352,13 +356,23 @@ impl IpFlipRustApp {
             gateway,
         };
 
-        self.add_profile(profile);
-        self.set_status("Configuration saved.", StatusTone::Success);
+        if self.add_profile(profile) {
+            self.set_status("Configuration saved.", StatusTone::Success);
+        } else {
+            self.set_status(
+                "A profile with this title or IP already exists.",
+                StatusTone::Neutral,
+            );
+        }
     }
 
-    fn add_profile(&mut self, profile: IpProfile) {
-        if self.profiles.iter().any(|p| p == &profile) {
-            return;
+    fn add_profile(&mut self, profile: IpProfile) -> bool {
+        if self
+            .profiles
+            .iter()
+            .any(|existing| profiles_conflict(existing, &profile))
+        {
+            return false;
         }
 
         self.profiles.push(profile.clone());
@@ -371,6 +385,7 @@ impl IpFlipRustApp {
             self.interfaces
                 .sort_by_key(|n| interface_sort_key_with_categories(&categories, n));
         }
+        true
     }
 
     fn remove_profile(&mut self, profile: &IpProfile) {
@@ -409,6 +424,7 @@ impl IpFlipRustApp {
 
                     if self.status_message == "Loading network interfaces..." {
                         self.status_message.clear();
+                        self.status_set_at = None;
                     }
                 }
                 WorkerMessage::SettingsLoaded {
@@ -472,10 +488,17 @@ impl IpFlipRustApp {
                     success_message,
                 } => match result {
                     Ok(()) => {
-                        if let Some(profile) = profile_to_save {
-                            self.add_profile(profile);
-                        }
-                        self.set_status(success_message, StatusTone::Success);
+                        let message = if let Some(profile) = profile_to_save {
+                            if self.add_profile(profile) {
+                                success_message
+                            } else {
+                                "Static IP applied; a profile with this title or IP already exists."
+                                    .to_string()
+                            }
+                        } else {
+                            success_message
+                        };
+                        self.set_status(message, StatusTone::Success);
                         self.request_interface_settings(interface_name, true);
                     }
                     Err(err) => {
@@ -529,6 +552,13 @@ fn status_colors(tone: StatusTone) -> (Color32, Color32) {
 impl App for IpFlipRustApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_worker_messages();
+        if self
+            .status_set_at
+            .is_some_and(|shown_at| shown_at.elapsed() >= Duration::from_secs(5))
+        {
+            self.status_message.clear();
+            self.status_set_at = None;
+        }
 
         // ---------- Global style ----------
         let mut style = (*ctx.style()).clone();
@@ -557,7 +587,7 @@ impl App for IpFlipRustApp {
             .frame(
                 Frame::new()
                     .fill(palette::BG)
-                    .inner_margin(egui::Margin::symmetric(20, 16)),
+                    .inner_margin(egui::Margin::symmetric(10, 10)),
             )
             .show_separator_line(false)
             .show(ctx, |ui| {
@@ -577,19 +607,33 @@ impl App for IpFlipRustApp {
                     });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let admin = !cfg!(target_os = "windows") || is_windows_admin();
-                        let (bg, fg, text) = if admin {
-                            (palette::SUCCESS_BG, palette::SUCCESS, "Administrator")
-                        } else {
-                            (palette::DANGER_BG, palette::DANGER, "Not elevated")
-                        };
-                        Frame::new()
-                            .fill(bg)
-                            .corner_radius(CornerRadius::same(20))
-                            .inner_margin(egui::Margin::symmetric(12, 6))
-                            .show(ui, |ui| {
-                                ui.label(RichText::new(text).color(fg).size(12.0).strong());
-                            });
+                        ui.with_layout(
+                            egui::Layout::top_down(egui::Align::RIGHT),
+                            |ui| {
+                                let admin = !cfg!(target_os = "windows") || is_windows_admin();
+                                let (bg, fg, text) = if admin {
+                                    (palette::SUCCESS_BG, palette::SUCCESS, "Administrator")
+                                } else {
+                                    (palette::DANGER_BG, palette::DANGER, "Not elevated")
+                                };
+                                Frame::new()
+                                    .fill(bg)
+                                    .corner_radius(CornerRadius::same(20))
+                                    .inner_margin(egui::Margin::symmetric(12, 6))
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(text).color(fg).size(12.0).strong());
+                                    });
+
+                                ui.label(
+                                    RichText::new(
+                                        "Changing IP settings on Windows usually requires running as administrator.",
+                                    )
+                                    .color(palette::TEXT_MUTED)
+                                    .size(11.0)
+                                    .italics(),
+                                );
+                            },
+                        );
                     });
                 });
             });
@@ -599,47 +643,48 @@ impl App for IpFlipRustApp {
             .frame(
                 Frame::new()
                     .fill(palette::BG)
-                    .inner_margin(egui::Margin::symmetric(20, 4)),
+                    .inner_margin(egui::Margin::same(10)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.columns(2, |columns| {
+                ui.columns(2, |columns| {
                             section_frame().show(&mut columns[0], |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("Saved Profiles")
-                                            .color(palette::TEXT_PRIMARY)
-                                            .size(17.0)
-                                            .strong(),
-                                    );
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        Frame::new()
-                                            .fill(palette::SURFACE_ALT)
-                                            .corner_radius(CornerRadius::same(10))
-                                            .inner_margin(egui::Margin::symmetric(8, 3))
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    RichText::new(format!("{}", self.profiles.len()))
-                                                        .color(palette::TEXT_SECONDARY)
-                                                        .size(12.0)
-                                                        .strong(),
-                                                );
-                                            });
+                                let panel_height = ui.available_height();
+                                ui.set_min_height(panel_height);
+                                let presets_disabled = self.interface_read_in_progress();
+                                ui.add_enabled_ui(!presets_disabled, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new("Saved Profiles")
+                                                .color(palette::TEXT_PRIMARY)
+                                                .size(17.0)
+                                                .strong(),
+                                        );
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            Frame::new()
+                                                .fill(palette::SURFACE_ALT)
+                                                .corner_radius(CornerRadius::same(10))
+                                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        RichText::new(format!("{}", self.profiles.len()))
+                                                            .color(palette::TEXT_SECONDARY)
+                                                            .size(12.0)
+                                                            .strong(),
+                                                    );
+                                                });
+                                        });
                                     });
-                                });
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("Click to load into the form · double-click to apply")
-                                        .color(palette::TEXT_MUTED)
-                                        .size(11.5),
-                                );
-                                ui.add_space(10.0);
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new("Click to load into the form · double-click to apply")
+                                            .color(palette::TEXT_MUTED)
+                                            .size(11.5),
+                                    );
+                                    ui.add_space(10.0);
 
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
                                         if self.profiles.is_empty() {
                                             ui.add_space(20.0);
                                             ui.vertical_centered(|ui| {
@@ -794,24 +839,27 @@ impl App for IpFlipRustApp {
                                             self.remove_profile(&profile);
                                             self.set_status("Profile deleted.", StatusTone::Neutral);
                                         }
+                                        });
                                     });
                             });
 
                             section_frame().show(&mut columns[1], |ui| {
-                                ui.label(
-                                    RichText::new("Network Settings")
-                                        .color(palette::TEXT_PRIMARY)
-                                        .size(17.0)
-                                        .strong(),
-                                );
+                                let panel_height = ui.available_height();
+                                ui.set_min_height(panel_height);
+                                let interface_read_in_progress = self.interface_read_in_progress();
+                                ui.add_enabled_ui(!interface_read_in_progress, |ui| {
+                                    ui.label(
+                                        RichText::new("Network Settings")
+                                            .color(palette::TEXT_PRIMARY)
+                                            .size(17.0)
+                                            .strong(),
+                                    );
                                 ui.add_space(12.0);
 
                                 field_label(ui, "INTERFACE");
                                 ui.add_space(4.0);
                                 let mut selected_changed = false;
-                                let selector_disabled = self.interface_selector_disabled();
-                                ui.add_enabled_ui(!selector_disabled, |ui| {
-                                    egui::ComboBox::from_id_salt("interface_spinner")
+                                egui::ComboBox::from_id_salt("interface_spinner")
                                         .selected_text(if self.selected_interface.is_empty() {
                                             "Select interface".to_string()
                                         } else {
@@ -843,7 +891,6 @@ impl App for IpFlipRustApp {
                                                 }
                                             }
                                         });
-                                });
 
                                 if selected_changed {
                                     self.sync_preset_name_from_selected();
@@ -933,36 +980,32 @@ impl App for IpFlipRustApp {
                                     }
                                 });
 
-                                ui.add_space(14.0);
-
-                                if !self.status_message.is_empty() {
-                                    let (bg, fg) = status_colors(self.status_tone);
-                                    Frame::new()
-                                        .fill(bg)
-                                        .corner_radius(CornerRadius::same(8))
-                                        .inner_margin(egui::Margin::symmetric(12, 8))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                RichText::new(self.status_message.clone())
-                                                    .color(fg)
-                                                    .size(12.5),
-                                            );
-                                        });
-                                    ui.add_space(8.0);
-                                }
-
-                                ui.label(
-                                    RichText::new(
-                                        "Changing IP settings on Windows usually requires running as administrator.",
-                                    )
-                                    .color(palette::TEXT_MUTED)
-                                    .size(11.0)
-                                    .italics(),
-                                );
                             });
                         });
                     });
             });
+
+        if !self.status_message.is_empty() {
+            let (bg, fg) = status_colors(self.status_tone);
+            egui::Area::new(egui::Id::new("status_toast"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 88.0))
+                .show(ctx, |ui| {
+                    ui.set_max_width(360.0);
+                    Frame::new()
+                        .fill(bg)
+                        .stroke(Stroke::new(1.0_f32, fg.linear_multiply(0.35)))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(self.status_message.clone())
+                                    .color(fg)
+                                    .size(12.5),
+                            );
+                        });
+                });
+        }
 
         ctx.request_repaint();
     }
@@ -970,8 +1013,18 @@ impl App for IpFlipRustApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_top_center_position, IpFlipRustApp, IpProfile};
+    use super::{compute_top_center_position, profiles_conflict, IpFlipRustApp, IpProfile};
     use std::sync::mpsc;
+
+    fn profile(name: &str, ip: &str) -> IpProfile {
+        IpProfile {
+            name: name.to_string(),
+            net_interface: "Ethernet".to_string(),
+            ip: ip.to_string(),
+            mask: "255.255.255.0".to_string(),
+            gateway: "192.168.1.1".to_string(),
+        }
+    }
 
     #[test]
     fn compute_top_center_position_places_window_near_screen_center_top() {
@@ -980,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn interface_selector_is_disabled_while_reading_details() {
+    fn interface_actions_are_disabled_while_reading_details() {
         let (tx, rx) = mpsc::channel();
         let app = IpFlipRustApp {
             profiles: vec![],
@@ -995,6 +1048,7 @@ mod tests {
             current_settings_message: String::new(),
             status_message: String::new(),
             status_tone: super::StatusTone::Neutral,
+            status_set_at: None,
             request_id: 0,
             interfaces_loading: false,
             interface_details_loading: true,
@@ -1003,7 +1057,7 @@ mod tests {
             profiles_path: Default::default(),
         };
 
-        assert!(app.interface_selector_disabled());
+        assert!(app.interface_read_in_progress());
     }
 
     #[test]
@@ -1013,6 +1067,22 @@ mod tests {
 
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].name, "");
+    }
+
+    #[test]
+    fn profiles_with_duplicate_titles_or_ips_conflict() {
+        assert!(profiles_conflict(
+            &profile("Office", "192.168.1.10"),
+            &profile("office", "192.168.1.11")
+        ));
+        assert!(profiles_conflict(
+            &profile("Office", "192.168.1.10"),
+            &profile("Home", "192.168.1.10")
+        ));
+        assert!(!profiles_conflict(
+            &profile("", "192.168.1.10"),
+            &profile("", "192.168.1.11")
+        ));
     }
 }
 
@@ -1140,16 +1210,38 @@ fn load_profiles(path: &Path) -> Vec<IpProfile> {
             continue;
         }
 
-        out.push(IpProfile {
+        let profile = IpProfile {
             name,
             net_interface: interface_name,
             ip,
             mask,
             gateway,
-        });
+        };
+        if !out
+            .iter()
+            .any(|existing| profiles_conflict(existing, &profile))
+        {
+            out.push(profile);
+        }
     }
 
     out
+}
+
+fn profiles_conflict(first: &IpProfile, second: &IpProfile) -> bool {
+    let first_name = first.name.trim();
+    let second_name = second.name.trim();
+    let same_title =
+        !first_name.is_empty() && first_name.eq_ignore_ascii_case(second_name);
+    let same_ip = match (
+        first.ip.trim().parse::<std::net::Ipv4Addr>(),
+        second.ip.trim().parse::<std::net::Ipv4Addr>(),
+    ) {
+        (Ok(first_ip), Ok(second_ip)) => first_ip == second_ip,
+        _ => first.ip.trim().eq_ignore_ascii_case(second.ip.trim()),
+    };
+
+    same_title || same_ip
 }
 
 fn save_profiles(path: &Path, profiles: &[IpProfile]) {
